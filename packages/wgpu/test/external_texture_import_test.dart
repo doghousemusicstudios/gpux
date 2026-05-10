@@ -58,6 +58,50 @@ void main() {
       instance.dispose();
     }
   });
+
+  test('imports a manually allocated Android hardware buffer', () async {
+    if (!Platform.isAndroid) {
+      markTestSkipped('AHardwareBuffer import test only runs on Android');
+      return;
+    }
+
+    final android = _AndroidHardwareBufferTestApi();
+    final ahb = android.allocateRgba(width: 32, height: 16);
+    if (ahb == nullptr) {
+      markTestSkipped('RGBA8 GPU-sampled AHardwareBuffer allocation failed');
+      return;
+    }
+
+    final instance = Wgpu.create(
+      const WgpuInstanceDescriptor(backends: WgpuBackend.vulkan),
+    );
+    final adapter = await instance.requestAdapter();
+    final device = await adapter.requestDevice();
+
+    WgpuTexture? imported;
+    try {
+      imported = WgpuTexture.fromAHardwareBuffer(
+        device,
+        ahb,
+        GpuTextureFormat.rgba8Unorm,
+        32,
+        16,
+      );
+
+      expect(imported.handle, isNot(0));
+      expect(imported.width, 32);
+      expect(imported.height, 16);
+      expect(
+        imported.usage & GpuTextureUsage.textureBinding,
+        GpuTextureUsage.textureBinding,
+      );
+    } finally {
+      imported?.dispose();
+      android.release(ahb);
+      adapter.dispose();
+      instance.dispose();
+    }
+  });
 }
 
 const _mtlPixelFormatBgra8Unorm = 80;
@@ -171,6 +215,88 @@ class _MetalTestApi {
     return using((arena) {
       return _selRegisterName(name.toNativeUtf8(allocator: arena).cast());
     });
+  }
+}
+
+final class _AHardwareBufferDesc extends Struct {
+  @Uint32()
+  external int width;
+
+  @Uint32()
+  external int height;
+
+  @Uint32()
+  external int layers;
+
+  @Uint32()
+  external int format;
+
+  @Uint64()
+  external int usage;
+
+  @Uint32()
+  external int stride;
+
+  @Uint32()
+  external int rfu0;
+
+  @Uint64()
+  external int rfu1;
+}
+
+const _ahardwareBufferFormatRgba8Unorm = 1;
+const _ahardwareBufferUsageGpuSampledImage = 0x100;
+
+class _AndroidHardwareBufferTestApi {
+  _AndroidHardwareBufferTestApi()
+    : _android = DynamicLibrary.open('libandroid.so');
+
+  final DynamicLibrary _android;
+
+  late final int Function(Pointer<_AHardwareBufferDesc>, Pointer<Pointer<Void>>)
+  _allocate = _android
+      .lookupFunction<
+        Int32 Function(Pointer<_AHardwareBufferDesc>, Pointer<Pointer<Void>>),
+        int Function(Pointer<_AHardwareBufferDesc>, Pointer<Pointer<Void>>)
+      >('AHardwareBuffer_allocate');
+
+  late final int Function(Pointer<_AHardwareBufferDesc>) _isSupported = _android
+      .lookupFunction<
+        Int32 Function(Pointer<_AHardwareBufferDesc>),
+        int Function(Pointer<_AHardwareBufferDesc>)
+      >('AHardwareBuffer_isSupported');
+
+  late final void Function(Pointer<Void>) release = _android
+      .lookupFunction<
+        Void Function(Pointer<Void>),
+        void Function(Pointer<Void>)
+      >('AHardwareBuffer_release');
+
+  Pointer<Void> allocateRgba({required int width, required int height}) {
+    final desc = calloc<_AHardwareBufferDesc>();
+    final out = calloc<Pointer<Void>>();
+    try {
+      desc.ref
+        ..width = width
+        ..height = height
+        ..layers = 1
+        ..format = _ahardwareBufferFormatRgba8Unorm
+        ..usage = _ahardwareBufferUsageGpuSampledImage
+        ..stride = 0
+        ..rfu0 = 0
+        ..rfu1 = 0;
+
+      if (_isSupported(desc) == 0) {
+        return nullptr;
+      }
+      if (_allocate(desc, out) != 0) {
+        return nullptr;
+      }
+      return out.value;
+    } finally {
+      calloc.free(out);
+      calloc.free(desc);
+    }
   }
 }
 

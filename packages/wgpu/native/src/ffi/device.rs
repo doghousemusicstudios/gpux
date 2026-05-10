@@ -8,6 +8,9 @@ use crate::api::types::*;
 use crate::handle::*;
 use crate::{clear_error, ffi_catch, set_error, LAST_ERROR, wgpu_get_last_error};
 
+#[cfg(target_os = "android")]
+use ash::android::external_memory_android_hardware_buffer;
+
 // =============================================================================
 // FEATURE BITMASK MAPPING
 // =============================================================================
@@ -480,16 +483,16 @@ pub extern "C" fn wgpun_AdapterRequestDevice(
             None
         };
 
-        let (device, queue) = match pollster::block_on(entry.adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: device_label.or(Some("wgpu_native_device")),
-                required_features: features,
-                required_limits: limits,
-                memory_hints: wgpu::MemoryHints::Performance,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-            },
-        )) {
+        let device_descriptor = wgpu::DeviceDescriptor {
+            label: device_label.or(Some("wgpu_native_device")),
+            required_features: features,
+            required_limits: limits,
+            memory_hints: wgpu::MemoryHints::Performance,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::default(),
+        };
+
+        let (device, queue) = match request_device(&entry.adapter, &device_descriptor) {
             Ok((d, q)) => (d, q),
             Err(e) => {
                 set_error(format!("Failed to request device: {}", e));
@@ -514,6 +517,51 @@ pub extern "C" fn wgpun_AdapterRequestDevice(
             errors,
         })
     })
+}
+
+#[cfg(target_os = "android")]
+fn request_device(
+    adapter: &wgpu::Adapter,
+    descriptor: &wgpu::DeviceDescriptor<'_>,
+) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    let Some(vulkan_adapter) = (unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() }) else {
+        return pollster::block_on(adapter.request_device(descriptor)).map_err(|error| error.to_string());
+    };
+
+    if !vulkan_adapter
+        .physical_device_capabilities()
+        .supports_extension(external_memory_android_hardware_buffer::NAME)
+    {
+        return pollster::block_on(adapter.request_device(descriptor)).map_err(|error| error.to_string());
+    }
+
+    let required_features = descriptor.required_features;
+    let required_limits = descriptor.required_limits.clone();
+    let memory_hints = descriptor.memory_hints.clone();
+    let hal_device = unsafe {
+        vulkan_adapter.open_with_callback(
+            required_features,
+            &required_limits,
+            &memory_hints,
+            Some(Box::new(|args| {
+                if !args.extensions.contains(&external_memory_android_hardware_buffer::NAME) {
+                    args.extensions.push(external_memory_android_hardware_buffer::NAME);
+                }
+            })),
+        )
+    }
+    .map_err(|error| format!("{error:?}"))?;
+
+    unsafe { adapter.create_device_from_hal::<wgpu::hal::api::Vulkan>(hal_device, descriptor) }
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "android"))]
+fn request_device(
+    adapter: &wgpu::Adapter,
+    descriptor: &wgpu::DeviceDescriptor<'_>,
+) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    pollster::block_on(adapter.request_device(descriptor)).map_err(|error| error.to_string())
 }
 
 /// Release a device.
