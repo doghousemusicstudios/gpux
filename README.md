@@ -2,6 +2,21 @@
 
 Cross-platform GPU packages for Dart and Flutter.
 
+## ShowUp fork note
+
+The `doghousemusicstudios/gpux` fork temporarily carries ShowUp Phase 2.0.5
+patches while the upstream PRs are reviewed:
+
+- `naga`: GLSL-to-WGSL translation via `glsl-in` and `wgsl-out`
+  (`https://github.com/dartgfx/gpux/pull/3`)
+- `wgpu`: external texture import FFI for Metal textures and IOSurface-backed
+  textures, plus an Android `AHardwareBuffer` stub that returns an error until
+  Vulkan import is device-tested (`https://github.com/dartgfx/gpux/pull/4`)
+
+ShowUp should use the `codex/phase-2-0-5-gpux-ffi` branch in
+`dependency_overrides` until equivalent upstream releases are available, then
+remove the overrides and return to pub.dev versions.
+
 ## Packages
 
 | Package | Description | pub.dev |
