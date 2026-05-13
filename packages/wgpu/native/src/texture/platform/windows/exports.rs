@@ -23,8 +23,9 @@ use windows::Win32::{
         Direct3D11::{
             D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Resource,
             ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
-            D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
+            D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+            D3D11_USAGE_DEFAULT,
         },
         Direct3D11on12::{D3D11On12CreateDevice, ID3D11On12Device, D3D11_RESOURCE_FLAGS},
         Direct3D12::{
@@ -37,16 +38,17 @@ use windows::Win32::{
             D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAGS,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_GENERIC_READ,
-            D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
-            D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_TEXTURE_COPY_LOCATION,
+            D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            D3D12_TEXTURE_LAYOUT_UNKNOWN,
         },
         Dxgi::Common::{
             DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
             DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
         },
-        Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIResource1},
+        Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIKeyedMutex, IDXGIResource1},
     },
     System::Threading::{CreateEventW, WaitForSingleObject, INFINITE},
 };
@@ -625,20 +627,33 @@ fn create_d3d11_nt_handle_producer(
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
         CPUAccessFlags: 0,
-        MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32,
-    };
-    let initial_data = D3D11_SUBRESOURCE_DATA {
-        pSysMem: sentinel.as_ptr() as *const c_void,
-        SysMemPitch: bytes_per_row,
-        SysMemSlicePitch: bytes_per_row * height,
+        MiscFlags: (D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX.0)
+            as u32,
     };
     let mut texture: Option<ID3D11Texture2D> = None;
-    unsafe { device.CreateTexture2D(&desc, Some(&initial_data), Some(&mut texture)) }
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) }
         .map_err(|error| format!("ID3D11Device::CreateTexture2D producer failed: {error}"))?;
     let texture = texture
         .ok_or_else(|| "ID3D11Device::CreateTexture2D returned no producer texture".to_string())?;
+    let keyed_mutex: IDXGIKeyedMutex = texture
+        .cast()
+        .map_err(|error| format!("ID3D11Texture2D::cast<IDXGIKeyedMutex> failed: {error}"))?;
     unsafe {
+        keyed_mutex
+            .AcquireSync(0, INFINITE)
+            .map_err(|error| format!("IDXGIKeyedMutex::AcquireSync producer failed: {error}"))?;
+        context.UpdateSubresource(
+            &texture,
+            0,
+            None,
+            sentinel.as_ptr() as *const c_void,
+            bytes_per_row,
+            bytes_per_row * height,
+        );
         context.Flush();
+        keyed_mutex
+            .ReleaseSync(1)
+            .map_err(|error| format!("IDXGIKeyedMutex::ReleaseSync producer failed: {error}"))?;
     }
 
     let dxgi_resource: IDXGIResource1 = texture
@@ -702,14 +717,23 @@ fn copy_d3d11_producer_into_d3d12_resource(
     let producer_resource: ID3D11Resource = producer_texture
         .cast()
         .map_err(|error| format!("ID3D11Texture2D::cast<ID3D11Resource> failed: {error}"))?;
+    let producer_mutex: IDXGIKeyedMutex = producer_texture
+        .cast()
+        .map_err(|error| format!("ID3D11Texture2D::cast<IDXGIKeyedMutex> failed: {error}"))?;
 
     let mut wrapped: Option<ID3D11Resource> = None;
+    let flags11 = D3D11_RESOURCE_FLAGS {
+        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+        MiscFlags: 0,
+        CPUAccessFlags: 0,
+        StructureByteStride: 0,
+    };
     unsafe {
         bridge_11on12.CreateWrappedResource(
             destination,
-            &D3D11_RESOURCE_FLAGS::default(),
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COMMON,
+            &flags11,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COPY_DEST,
             &mut wrapped,
         )
     }
@@ -720,10 +744,16 @@ fn copy_d3d11_producer_into_d3d12_resource(
 
     let wrapped_resources = [Some(wrapped.clone())];
     unsafe {
+        producer_mutex
+            .AcquireSync(1, INFINITE)
+            .map_err(|error| format!("IDXGIKeyedMutex::AcquireSync bridge failed: {error}"))?;
         bridge_11on12.AcquireWrappedResources(&wrapped_resources);
         bridge_context.CopyResource(&wrapped, &producer_resource);
         bridge_11on12.ReleaseWrappedResources(&wrapped_resources);
         bridge_context.Flush();
+        producer_mutex
+            .ReleaseSync(2)
+            .map_err(|error| format!("IDXGIKeyedMutex::ReleaseSync bridge failed: {error}"))?;
     }
     wait_for_d3d12_queue(raw_device, raw_queue)
 }

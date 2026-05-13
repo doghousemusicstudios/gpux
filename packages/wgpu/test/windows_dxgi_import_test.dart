@@ -208,9 +208,7 @@ void main() {
 
         if (result.status ==
                 WgpuWindowsD3D11DxgiProducerBridgeProofStatus.failed &&
-            (result.message.contains('requires the D3D12 backend') ||
-                result.message.contains('D3D11CreateDevice failed') ||
-                result.message.contains('D3D11On12CreateDevice failed'))) {
+            result.message.contains('requires the D3D12 backend')) {
           markTestSkipped(result.message);
           return;
         }

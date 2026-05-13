@@ -68,3 +68,15 @@ Run the `gen_bindings.sh` script to regenerate FFI bindings from the Rust code. 
 ```
 
 Requires `cbindgen` (`cargo install cbindgen`) and `ffigen` (`dart pub global activate ffigen`).
+
+## Windows DXGI Probe
+
+Run this on real Windows hardware with a DX12 adapter before claiming Windows
+DXGI import or producer bridge coverage:
+
+```bash
+dart run bin/windows_dxgi_probe.dart
+```
+
+The probe prints JSON for the D3D12 shared-texture import proof and the D3D11
+producer bridge proof, and exits nonzero when either proof fails.
