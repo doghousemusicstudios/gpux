@@ -36,6 +36,43 @@ external int wgpun_DeviceImportIOSurfacePlane(
   int _format,
 );
 
+@ffi.Native<
+  ffi.Uint64 Function(
+    ffi.Uint64,
+    ffi.Uint64,
+    ffi.Uint8,
+    ffi.Uint32,
+    ffi.Uint32,
+    ffi.Uint32,
+    ffi.Uint32,
+    ffi.Uint32,
+    ffi.Uint32,
+    ffi.Uint8,
+    ffi.Uint64,
+    ffi.Uint64,
+    ffi.Int64,
+    ffi.Uint32,
+    ffi.Int32,
+  )
+>()
+external int wgpun_DeviceImportDxgiSharedTexture(
+  int _device,
+  int _shared_handle,
+  int _owns_handle,
+  int _width,
+  int _height,
+  int _format,
+  int _usage,
+  int _plane_count,
+  int _color_space,
+  int _keyed_mutex_enabled,
+  int _keyed_mutex_acquire_key,
+  int _keyed_mutex_release_key,
+  int _keyed_mutex_timeout_ms,
+  int _producer_adapter_luid_low,
+  int _producer_adapter_luid_high,
+);
+
 @ffi.Native<ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)>()
 external ffi.Pointer<ffi.Void> wgpun_IOSurfaceRetain(
   ffi.Pointer<ffi.Void> _iosurface,

@@ -16,3 +16,4 @@ export 'src/pipeline.dart';
 export 'src/query_set.dart';
 export 'src/buffer_mapping.dart';
 export 'src/fence.dart';
+export 'src/windows/device.dart';

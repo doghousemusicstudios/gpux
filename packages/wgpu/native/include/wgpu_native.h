@@ -460,6 +460,23 @@ WGPUTexture wgpun_DeviceImportIOSurfacePlane(WGPUDevice _device,
 ;
 #endif
 
+WGPUTexture wgpun_DeviceImportDxgiSharedTexture(WGPUDevice device,
+                                                uint64_t shared_handle,
+                                                uint8_t owns_handle,
+                                                uint32_t width,
+                                                uint32_t height,
+                                                uint32_t format,
+                                                uint32_t usage,
+                                                uint32_t plane_count,
+                                                uint32_t color_space,
+                                                uint8_t keyed_mutex_enabled,
+                                                uint64_t keyed_mutex_acquire_key,
+                                                uint64_t keyed_mutex_release_key,
+                                                int64_t keyed_mutex_timeout_ms,
+                                                uint32_t producer_adapter_luid_low,
+                                                int32_t producer_adapter_luid_high)
+;
+
 #if defined(TARGET_APPLE)
  void *wgpun_IOSurfaceRetain(void *iosurface) ;
 #endif
