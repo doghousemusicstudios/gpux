@@ -115,23 +115,45 @@ void main() {
         return;
       }
 
-      final instance = Wgpu.create();
-      final adapter = await instance.requestAdapter();
-      final device = await adapter.requestDevice();
-
-      final result = device.windows.runD3D12DxgiSharedTextureSyntheticProof();
-
-      if (result.status == WgpuWindowsD3D12DxgiSyntheticProofStatus.failed &&
-          result.message.contains('requires the D3D12 backend')) {
-        markTestSkipped(result.message);
+      final Wgpu instance;
+      try {
+        instance = Wgpu.create(
+          const WgpuInstanceDescriptor(backends: WgpuBackend.dx12),
+        );
+      } catch (error) {
+        markTestSkipped('D3D12 backend unavailable: $error');
         return;
       }
 
-      expect(result.status, WgpuWindowsD3D12DxgiSyntheticProofStatus.passed);
-      expect(result.passed, isTrue);
+      WgpuAdapter? adapter;
+      try {
+        adapter = await instance.requestAdapter();
+      } catch (error) {
+        instance.dispose();
+        markTestSkipped('D3D12 adapter unavailable: $error');
+        return;
+      }
 
-      adapter.dispose();
-      instance.dispose();
+      try {
+        final device = await adapter.requestDevice();
+        final result = device.windows.runD3D12DxgiSharedTextureSyntheticProof();
+
+        if (result.status == WgpuWindowsD3D12DxgiSyntheticProofStatus.failed &&
+            result.message.contains('requires the D3D12 backend')) {
+          markTestSkipped(result.message);
+          return;
+        }
+
+        expect(
+          result.status,
+          WgpuWindowsD3D12DxgiSyntheticProofStatus.passed,
+          reason: result.message,
+        );
+        expect(result.passed, isTrue, reason: result.message);
+      } finally {
+        adapter.dispose();
+        instance.dispose();
+      }
     });
   });
 }

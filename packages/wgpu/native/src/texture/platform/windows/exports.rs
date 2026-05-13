@@ -10,24 +10,36 @@ use crate::set_error;
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 #[cfg(target_os = "windows")]
-use windows::core::PCWSTR;
+use std::mem::ManuallyDrop;
+#[cfg(target_os = "windows")]
+use std::sync::mpsc;
+#[cfg(target_os = "windows")]
+use windows::core::{Interface, PCWSTR};
 #[cfg(target_os = "windows")]
 use windows::Win32::{
-    Foundation::{CloseHandle, GENERIC_ALL, HANDLE},
+    Foundation::{CloseHandle, GENERIC_ALL, HANDLE, WAIT_OBJECT_0},
     Graphics::{
         Direct3D12::{
-            ID3D12Resource, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_HEAP_FLAG_SHARED,
-            D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_UNKNOWN,
-            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
-            D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Fence,
+            ID3D12GraphicsCommandList, ID3D12Resource, D3D12_COMMAND_LIST_TYPE_DIRECT,
+            D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE,
+            D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
+            D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_UNKNOWN, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+            D3D12_RANGE, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
+            D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_GENERIC_READ,
+            D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
+            D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         },
         Dxgi::Common::{
             DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-            DXGI_SAMPLE_DESC,
+            DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
         },
     },
+    System::Threading::{CreateEventW, WaitForSingleObject, INFINITE},
 };
 
 #[cfg(target_os = "windows")]
@@ -85,6 +97,336 @@ fn d3d12_synthetic_texture_desc(width: u32, height: u32) -> D3D12_RESOURCE_DESC 
 }
 
 #[cfg(target_os = "windows")]
+fn synthetic_sentinel_pixels(width: u32, height: u32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let offset = ((y * width + x) * 4) as usize;
+            pixels[offset] = (x ^ y) as u8;
+            pixels[offset + 1] = y.wrapping_mul(3) as u8;
+            pixels[offset + 2] = x.wrapping_mul(5) as u8;
+            pixels[offset + 3] = 0xff;
+        }
+    }
+    pixels
+}
+
+#[cfg(target_os = "windows")]
+fn d3d12_upload_buffer_desc(size: u64) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Alignment: 0,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_UNKNOWN,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_NONE,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_d3d12_queue(
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    raw_queue: &ID3D12CommandQueue,
+) -> Result<(), String> {
+    let fence: ID3D12Fence = unsafe { raw_device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }
+        .map_err(|error| format!("ID3D12Device::CreateFence failed: {error}"))?;
+    unsafe { raw_queue.Signal(&fence, 1) }
+        .map_err(|error| format!("ID3D12CommandQueue::Signal failed: {error}"))?;
+
+    if unsafe { fence.GetCompletedValue() } >= 1 {
+        return Ok(());
+    }
+
+    let event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
+        .map_err(|error| format!("CreateEventW failed: {error}"))?;
+    let wait_result = unsafe {
+        fence
+            .SetEventOnCompletion(1, event)
+            .map_err(|error| format!("ID3D12Fence::SetEventOnCompletion failed: {error}"))?;
+        WaitForSingleObject(event, INFINITE)
+    };
+    let _ = unsafe { CloseHandle(event) };
+
+    if wait_result != WAIT_OBJECT_0 {
+        return Err(format!(
+            "WaitForSingleObject returned unexpected result {:?}",
+            wait_result
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn write_d3d12_sentinel_pixels(
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    raw_queue: &ID3D12CommandQueue,
+    resource: &ID3D12Resource,
+    texture_desc: &D3D12_RESOURCE_DESC,
+    width: u32,
+    height: u32,
+    sentinel: &[u8],
+) -> Result<(), String> {
+    let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut row_count = 0u32;
+    let mut row_size = 0u64;
+    let mut total_bytes = 0u64;
+    unsafe {
+        raw_device.GetCopyableFootprints(
+            texture_desc as *const D3D12_RESOURCE_DESC,
+            0,
+            1,
+            0,
+            Some(&mut layout),
+            Some(&mut row_count),
+            Some(&mut row_size),
+            Some(&mut total_bytes),
+        );
+    }
+
+    let bytes_per_row = (width * 4) as usize;
+    if row_count != height {
+        return Err(format!(
+            "D3D12 copy footprint rows {row_count} do not match texture height {height}"
+        ));
+    }
+    if row_size < bytes_per_row as u64 {
+        return Err(format!(
+            "D3D12 copy footprint row size {row_size} is smaller than expected {bytes_per_row}"
+        ));
+    }
+    if sentinel.len() != bytes_per_row * height as usize {
+        return Err("DXGI synthetic proof sentinel byte count is invalid".to_string());
+    }
+
+    let upload_heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+    };
+    let upload_desc = d3d12_upload_buffer_desc(total_bytes);
+    let mut upload: Option<ID3D12Resource> = None;
+    unsafe {
+        raw_device.CreateCommittedResource(
+            &upload_heap,
+            D3D12_HEAP_FLAG_NONE,
+            &upload_desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            None,
+            &mut upload,
+        )
+    }
+    .map_err(|error| format!("ID3D12Device::CreateCommittedResource upload failed: {error}"))?;
+    let upload = upload.ok_or_else(|| {
+        "ID3D12Device::CreateCommittedResource returned no upload buffer".to_string()
+    })?;
+
+    let read_range = D3D12_RANGE { Begin: 0, End: 0 };
+    let written_range = D3D12_RANGE {
+        Begin: 0,
+        End: total_bytes as usize,
+    };
+    let mut upload_data: *mut c_void = std::ptr::null_mut();
+    unsafe {
+        upload.Map(
+            0,
+            Some(&read_range as *const D3D12_RANGE),
+            Some(&mut upload_data as *mut *mut c_void),
+        )
+    }
+    .map_err(|error| format!("ID3D12Resource::Map upload failed: {error}"))?;
+    if upload_data.is_null() {
+        return Err("ID3D12Resource::Map upload returned null".to_string());
+    }
+    let upload_base = upload_data as *mut u8;
+    for y in 0..height as usize {
+        let src = sentinel.as_ptr().wrapping_add(y * bytes_per_row);
+        let dst = unsafe {
+            upload_base.add(layout.Offset as usize + y * layout.Footprint.RowPitch as usize)
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst, bytes_per_row);
+        }
+    }
+    unsafe {
+        upload.Unmap(0, Some(&written_range as *const D3D12_RANGE));
+    }
+
+    let allocator: ID3D12CommandAllocator =
+        unsafe { raw_device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
+            .map_err(|error| format!("ID3D12Device::CreateCommandAllocator failed: {error}"))?;
+    let command_list: ID3D12GraphicsCommandList = unsafe {
+        raw_device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+    }
+    .map_err(|error| format!("ID3D12Device::CreateCommandList failed: {error}"))?;
+
+    let mut src_location = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: ManuallyDrop::new(Some(upload.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            PlacedFootprint: layout,
+        },
+    };
+    let mut dst_location = D3D12_TEXTURE_COPY_LOCATION {
+        pResource: ManuallyDrop::new(Some(resource.clone())),
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+            SubresourceIndex: 0,
+        },
+    };
+
+    unsafe {
+        command_list.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, None);
+        ManuallyDrop::drop(&mut src_location.pResource);
+        ManuallyDrop::drop(&mut dst_location.pResource);
+    }
+    unsafe { command_list.Close() }
+        .map_err(|error| format!("ID3D12GraphicsCommandList::Close failed: {error}"))?;
+    let command_list_base: ID3D12CommandList = command_list
+        .cast()
+        .map_err(|error| format!("ID3D12GraphicsCommandList::cast failed: {error}"))?;
+    unsafe {
+        raw_queue.ExecuteCommandLists(&[Some(command_list_base)]);
+    }
+    wait_for_d3d12_queue(raw_device, raw_queue)
+}
+
+#[cfg(target_os = "windows")]
+fn validate_imported_texture_sentinel(
+    entry: &DeviceEntry,
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    raw_queue: &ID3D12CommandQueue,
+    resource: &ID3D12Resource,
+    texture_desc: &D3D12_RESOURCE_DESC,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let bytes_per_row = width * 4;
+    let padded_bytes_per_row = (bytes_per_row + 255) & !255;
+    let buffer_size = (padded_bytes_per_row * height) as u64;
+    let sentinel = synthetic_sentinel_pixels(width, height);
+
+    entry.queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &sentinel,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(height),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    entry.queue.submit(std::iter::empty());
+    let _ = entry.device.poll(wgpu::PollType::wait_indefinitely());
+    write_d3d12_sentinel_pixels(
+        raw_device,
+        raw_queue,
+        resource,
+        texture_desc,
+        width,
+        height,
+        &sentinel,
+    )?;
+
+    let staging = entry.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("DXGI synthetic proof readback"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = entry
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("DXGI synthetic proof readback encoder"),
+        });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &staging,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    entry.queue.submit(std::iter::once(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (tx, rx) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    let _ = entry.device.poll(wgpu::PollType::wait_indefinitely());
+    match rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(format!(
+                "DXGI synthetic proof readback map_async failed: {error}"
+            ));
+        }
+        Err(_) => return Err("DXGI synthetic proof readback channel closed".to_string()),
+    }
+
+    let mismatch = {
+        let mapped = slice.get_mapped_range();
+        let mut mismatch = None;
+        for y in 0..height {
+            let expected_start = (y * bytes_per_row) as usize;
+            let actual_start = (y * padded_bytes_per_row) as usize;
+            let expected = &sentinel[expected_start..expected_start + bytes_per_row as usize];
+            let actual = &mapped[actual_start..actual_start + bytes_per_row as usize];
+            if actual != expected {
+                let byte_index = actual
+                    .iter()
+                    .zip(expected.iter())
+                    .position(|(actual, expected)| actual != expected)
+                    .unwrap_or(0);
+                mismatch = Some((y, byte_index, actual[byte_index], expected[byte_index]));
+                break;
+            }
+        }
+        mismatch
+    };
+    staging.unmap();
+    if let Some((row, byte_index, actual, expected)) = mismatch {
+        return Err(format!(
+            "DXGI synthetic proof sentinel mismatch on row {row}, byte {byte_index}: actual {actual:#04x}, expected {expected:#04x}"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(), String> {
     if device == 0 {
         return Err("device must not be 0".to_string());
@@ -100,6 +442,7 @@ fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(
         }
     };
     let raw_device = hal_device.raw_device();
+    let raw_queue = hal_device.raw_queue();
     let heap_properties = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -135,11 +478,24 @@ fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(
         64,
         64,
         22,
-        (wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC).bits(),
+        (wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST)
+            .bits(),
         1,
         0,
         luid.LowPart,
         luid.HighPart,
+    )?;
+    validate_imported_texture_sentinel(
+        entry,
+        raw_device,
+        raw_queue,
+        &resource,
+        &texture_desc,
+        &texture,
+        64,
+        64,
     )?;
     drop(texture);
     Ok(())
