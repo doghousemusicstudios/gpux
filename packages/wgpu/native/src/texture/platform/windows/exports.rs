@@ -26,8 +26,8 @@ use windows::Win32::{
             D3D12_HEAP_FLAG_SHARED, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
             D3D12_HEAP_TYPE_UPLOAD, D3D12_MEMORY_POOL_UNKNOWN, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
             D3D12_RANGE, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
-            D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-            D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_FLAGS,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_GENERIC_READ,
             D3D12_TEXTURE_COPY_LOCATION, D3D12_TEXTURE_COPY_LOCATION_0,
@@ -46,6 +46,29 @@ use windows::Win32::{
 fn close_owned_handle(handle: HANDLE, owns_handle: u8) {
     if owns_handle != 0 {
         let _ = unsafe { CloseHandle(handle) };
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct OwnedDxgiHandle(HANDLE);
+
+#[cfg(target_os = "windows")]
+impl OwnedDxgiHandle {
+    fn new(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
+    fn value(&self) -> u64 {
+        self.0 .0 as usize as u64
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedDxgiHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
     }
 }
 
@@ -78,7 +101,11 @@ fn allowed_usage_for_resource(
 }
 
 #[cfg(target_os = "windows")]
-fn d3d12_synthetic_texture_desc(width: u32, height: u32) -> D3D12_RESOURCE_DESC {
+fn d3d12_synthetic_texture_desc_with_flags(
+    width: u32,
+    height: u32,
+    flags: D3D12_RESOURCE_FLAGS,
+) -> D3D12_RESOURCE_DESC {
     D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
         Alignment: 0,
@@ -92,7 +119,7 @@ fn d3d12_synthetic_texture_desc(width: u32, height: u32) -> D3D12_RESOURCE_DESC 
             Quality: 0,
         },
         Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
-        Flags: D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+        Flags: flags,
     }
 }
 
@@ -427,22 +454,20 @@ fn validate_imported_texture_sentinel(
 }
 
 #[cfg(target_os = "windows")]
-fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(), String> {
-    if device == 0 {
-        return Err("device must not be 0".to_string());
-    }
+fn synthetic_import_usage() -> u32 {
+    (wgpu::TextureUsages::TEXTURE_BINDING
+        | wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST)
+        .bits()
+}
 
-    let entry = unsafe { deref_handle::<DeviceEntry>(device) };
-    let hal_device = match unsafe { entry.device.as_hal::<wgpu::hal::api::Dx12>() } {
-        Some(hal_device) => hal_device,
-        None => {
-            return Err(
-                "DXGI D3D12 shared texture synthetic proof requires the D3D12 backend".to_string(),
-            );
-        }
-    };
-    let raw_device = hal_device.raw_device();
-    let raw_queue = hal_device.raw_queue();
+#[cfg(target_os = "windows")]
+fn create_d3d12_shared_texture(
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    width: u32,
+    height: u32,
+    flags: D3D12_RESOURCE_FLAGS,
+) -> Result<(D3D12_RESOURCE_DESC, ID3D12Resource, OwnedDxgiHandle), String> {
     let heap_properties = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -450,7 +475,7 @@ fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(
         CreationNodeMask: 1,
         VisibleNodeMask: 1,
     };
-    let texture_desc = d3d12_synthetic_texture_desc(64, 64);
+    let texture_desc = d3d12_synthetic_texture_desc_with_flags(width, height, flags);
     let mut resource: Option<ID3D12Resource> = None;
     unsafe {
         raw_device.CreateCommittedResource(
@@ -470,22 +495,146 @@ fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(
         unsafe { raw_device.CreateSharedHandle(&resource, None, GENERIC_ALL.0, PCWSTR::null()) }
             .map_err(|error| format!("ID3D12Device::CreateSharedHandle failed: {error}"))?;
 
-    let luid = unsafe { raw_device.GetAdapterLuid() };
-    let texture = import_dxgi_shared_texture(
+    Ok((texture_desc, resource, OwnedDxgiHandle::new(shared_handle)))
+}
+
+#[cfg(target_os = "windows")]
+fn import_synthetic_shared_texture(
+    device: WGPUDevice,
+    shared_handle: &OwnedDxgiHandle,
+    width: u32,
+    height: u32,
+    producer_adapter_luid_low: u32,
+    producer_adapter_luid_high: i32,
+) -> Result<wgpu::Texture, String> {
+    import_dxgi_shared_texture(
         device,
-        shared_handle.0 as usize as u64,
+        shared_handle.value(),
+        0,
+        width,
+        height,
+        22,
+        synthetic_import_usage(),
         1,
+        0,
+        producer_adapter_luid_low,
+        producer_adapter_luid_high,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn expect_synthetic_import_failure(
+    device: WGPUDevice,
+    shared_handle: &OwnedDxgiHandle,
+    width: u32,
+    height: u32,
+    format: u32,
+    expected_error: &str,
+    proof_name: &str,
+    producer_adapter_luid_low: u32,
+    producer_adapter_luid_high: i32,
+) -> Result<(), String> {
+    match import_dxgi_shared_texture(
+        device,
+        shared_handle.value(),
+        0,
+        width,
+        height,
+        format,
+        synthetic_import_usage(),
+        1,
+        0,
+        producer_adapter_luid_low,
+        producer_adapter_luid_high,
+    ) {
+        Ok(texture) => {
+            drop(texture);
+            Err(format!(
+                "DXGI synthetic proof accepted invalid descriptor for {proof_name}"
+            ))
+        }
+        Err(error) if error.contains(expected_error) => Ok(()),
+        Err(error) => Err(format!(
+            "DXGI synthetic proof {proof_name} returned unexpected error: {error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn validate_import_descriptor_rejections(
+    device: WGPUDevice,
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    producer_adapter_luid_low: u32,
+    producer_adapter_luid_high: i32,
+) -> Result<(), String> {
+    let (_, _resource, shared_handle) = create_d3d12_shared_texture(
+        raw_device,
+        64,
+        64,
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+    )?;
+    expect_synthetic_import_failure(
+        device,
+        &shared_handle,
+        63,
+        64,
+        22,
+        "shared resource dimensions",
+        "mismatched dimensions",
+        producer_adapter_luid_low,
+        producer_adapter_luid_high,
+    )?;
+    expect_synthetic_import_failure(
+        device,
+        &shared_handle,
+        64,
+        64,
+        23,
+        "does not match descriptor",
+        "mismatched format",
+        producer_adapter_luid_low,
+        producer_adapter_luid_high,
+    )?;
+
+    let (_, _resource, shared_handle) =
+        create_d3d12_shared_texture(raw_device, 64, 64, D3D12_RESOURCE_FLAG_NONE)?;
+    expect_synthetic_import_failure(
+        device,
+        &shared_handle,
         64,
         64,
         22,
-        (wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST)
-            .bits(),
-        1,
-        0,
-        luid.LowPart,
-        luid.HighPart,
+        "D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS",
+        "missing simultaneous access flag",
+        producer_adapter_luid_low,
+        producer_adapter_luid_high,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn validate_import_readback_lifecycle(
+    device: WGPUDevice,
+    entry: &DeviceEntry,
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    raw_queue: &ID3D12CommandQueue,
+    width: u32,
+    height: u32,
+    producer_adapter_luid_low: u32,
+    producer_adapter_luid_high: i32,
+) -> Result<(), String> {
+    let (texture_desc, resource, shared_handle) = create_d3d12_shared_texture(
+        raw_device,
+        width,
+        height,
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+    )?;
+    let texture = import_synthetic_shared_texture(
+        device,
+        &shared_handle,
+        width,
+        height,
+        producer_adapter_luid_low,
+        producer_adapter_luid_high,
     )?;
     validate_imported_texture_sentinel(
         entry,
@@ -494,10 +643,53 @@ fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(
         &resource,
         &texture_desc,
         &texture,
-        64,
-        64,
+        width,
+        height,
     )?;
     drop(texture);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(), String> {
+    if device == 0 {
+        return Err("device must not be 0".to_string());
+    }
+
+    let entry = unsafe { deref_handle::<DeviceEntry>(device) };
+    let hal_device = match unsafe { entry.device.as_hal::<wgpu::hal::api::Dx12>() } {
+        Some(hal_device) => hal_device,
+        None => {
+            return Err(
+                "DXGI D3D12 shared texture synthetic proof requires the D3D12 backend".to_string(),
+            );
+        }
+    };
+    let raw_device = hal_device.raw_device();
+    let raw_queue = hal_device.raw_queue();
+    let luid = unsafe { raw_device.GetAdapterLuid() };
+
+    validate_import_descriptor_rejections(device, raw_device, luid.LowPart, luid.HighPart)?;
+    validate_import_readback_lifecycle(
+        device,
+        entry,
+        raw_device,
+        raw_queue,
+        64,
+        64,
+        luid.LowPart,
+        luid.HighPart,
+    )?;
+    validate_import_readback_lifecycle(
+        device,
+        entry,
+        raw_device,
+        raw_queue,
+        31,
+        17,
+        luid.LowPart,
+        luid.HighPart,
+    )?;
     Ok(())
 }
 
