@@ -14,7 +14,9 @@ use windows::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Graphics::{
         Direct3D12::{
-            ID3D12Resource, D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ID3D12Resource, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         },
         Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB},
     },
@@ -37,6 +39,22 @@ fn import_format(format: u32) -> Option<(wgpu::TextureFormat, DXGI_FORMAT)> {
         )),
         _ => None,
     }
+}
+
+#[cfg(target_os = "windows")]
+fn allowed_usage_for_resource(
+    flags: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAGS,
+) -> wgpu::TextureUsages {
+    let mut usage = wgpu::TextureUsages::COPY_SRC
+        | wgpu::TextureUsages::COPY_DST
+        | wgpu::TextureUsages::TEXTURE_BINDING;
+    if flags.contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+        usage |= wgpu::TextureUsages::STORAGE_BINDING;
+    }
+    if flags.contains(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) {
+        usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+    }
+    usage
 }
 
 #[cfg(target_os = "windows")]
@@ -155,6 +173,22 @@ fn import_dxgi_shared_texture(
     }
     if resource_desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN {
         return Err("shared resource layout must be D3D12_TEXTURE_LAYOUT_UNKNOWN".to_string());
+    }
+    if !resource_desc
+        .Flags
+        .contains(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)
+    {
+        return Err(
+            "shared resource must set D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS".to_string(),
+        );
+    }
+
+    let allowed_usage = allowed_usage_for_resource(resource_desc.Flags);
+    if !allowed_usage.contains(texture_usage) {
+        return Err(format!(
+            "requested WGPU usage {:?} exceeds shared resource usage {:?}",
+            texture_usage, allowed_usage
+        ));
     }
 
     let size = wgpu::Extent3d {
