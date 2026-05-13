@@ -10,15 +10,23 @@ use crate::set_error;
 #[cfg(target_os = "windows")]
 use std::ffi::c_void;
 #[cfg(target_os = "windows")]
+use windows::core::PCWSTR;
+#[cfg(target_os = "windows")]
 use windows::Win32::{
-    Foundation::{CloseHandle, HANDLE},
+    Foundation::{CloseHandle, GENERIC_ALL, HANDLE},
     Graphics::{
         Direct3D12::{
-            ID3D12Resource, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            ID3D12Resource, D3D12_CPU_PAGE_PROPERTY_UNKNOWN, D3D12_HEAP_FLAG_SHARED,
+            D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_MEMORY_POOL_UNKNOWN,
+            D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
-            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON,
+            D3D12_TEXTURE_LAYOUT_UNKNOWN,
         },
-        Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB},
+        Dxgi::Common::{
+            DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            DXGI_SAMPLE_DESC,
+        },
     },
 };
 
@@ -55,6 +63,86 @@ fn allowed_usage_for_resource(
         usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
     }
     usage
+}
+
+#[cfg(target_os = "windows")]
+fn d3d12_synthetic_texture_desc(width: u32, height: u32) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Alignment: 0,
+        Width: width as u64,
+        Height: height,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(), String> {
+    if device == 0 {
+        return Err("device must not be 0".to_string());
+    }
+
+    let entry = unsafe { deref_handle::<DeviceEntry>(device) };
+    let hal_device = match unsafe { entry.device.as_hal::<wgpu::hal::api::Dx12>() } {
+        Some(hal_device) => hal_device,
+        None => {
+            return Err(
+                "DXGI D3D12 shared texture synthetic proof requires the D3D12 backend".to_string(),
+            );
+        }
+    };
+    let raw_device = hal_device.raw_device();
+    let heap_properties = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_DEFAULT,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
+        CreationNodeMask: 1,
+        VisibleNodeMask: 1,
+    };
+    let texture_desc = d3d12_synthetic_texture_desc(64, 64);
+    let mut resource: Option<ID3D12Resource> = None;
+    unsafe {
+        raw_device.CreateCommittedResource(
+            &heap_properties,
+            D3D12_HEAP_FLAG_SHARED,
+            &texture_desc,
+            D3D12_RESOURCE_STATE_COMMON,
+            None,
+            &mut resource,
+        )
+    }
+    .map_err(|error| format!("ID3D12Device::CreateCommittedResource failed: {error}"))?;
+
+    let resource = resource
+        .ok_or_else(|| "ID3D12Device::CreateCommittedResource returned no texture".to_string())?;
+    let shared_handle =
+        unsafe { raw_device.CreateSharedHandle(&resource, None, GENERIC_ALL.0, PCWSTR::null()) }
+            .map_err(|error| format!("ID3D12Device::CreateSharedHandle failed: {error}"))?;
+
+    let luid = unsafe { raw_device.GetAdapterLuid() };
+    let texture = import_dxgi_shared_texture(
+        device,
+        shared_handle.0 as usize as u64,
+        1,
+        64,
+        64,
+        22,
+        (wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC).bits(),
+        1,
+        0,
+        luid.LowPart,
+        luid.HighPart,
+    )?;
+    drop(texture);
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -222,6 +310,27 @@ fn import_dxgi_shared_texture(
             .device
             .create_texture_from_hal::<wgpu::hal::api::Dx12>(hal_texture, &texture_desc)
     })
+}
+
+#[cfg(target_os = "windows")]
+#[export_name = "wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof"]
+pub extern "C" fn wgpuDeviceRunD3D12DxgiSharedTextureSyntheticProof(device: WGPUDevice) -> u8 {
+    ffi_catch!(0, {
+        match run_d3d12_dxgi_shared_texture_synthetic_proof(device) {
+            Ok(()) => 1,
+            Err(error) => {
+                set_error(error);
+                0
+            }
+        }
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+#[export_name = "wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof"]
+pub extern "C" fn wgpuDeviceRunD3D12DxgiSharedTextureSyntheticProof(_device: WGPUDevice) -> u8 {
+    set_error("DXGI D3D12 shared texture synthetic proof is only supported on Windows");
+    0
 }
 
 #[cfg(target_os = "windows")]

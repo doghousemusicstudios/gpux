@@ -56,7 +56,34 @@ final class WgpuWindowsDevice {
       label: descriptor.label,
     );
   }
+
+  WgpuWindowsD3D12DxgiSyntheticProofResult
+  runD3D12DxgiSharedTextureSyntheticProof() {
+    if (device.handle <= 0) {
+      throw ArgumentError('device handle must be positive');
+    }
+
+    final passed = wgpu_ffi.wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof(
+      device.handle,
+    );
+    if (passed != 0) {
+      return const WgpuWindowsD3D12DxgiSyntheticProofResult.passed(
+        'DXGI D3D12 shared texture synthetic proof passed.',
+      );
+    }
+
+    final message =
+        wgpu_ffi.wgpuLastError() ??
+        'Native symbol $_d3d12DxgiSharedTextureSyntheticProofNativeSymbol returned failure.';
+    if (message.contains('only supported on Windows')) {
+      return WgpuWindowsD3D12DxgiSyntheticProofResult.unsupported(message);
+    }
+    return WgpuWindowsD3D12DxgiSyntheticProofResult.failed(message);
+  }
 }
+
+const _d3d12DxgiSharedTextureSyntheticProofNativeSymbol =
+    'wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof';
 
 final class WgpuWindowsDxgiSharedTextureDescriptor {
   const WgpuWindowsDxgiSharedTextureDescriptor({
@@ -114,6 +141,39 @@ final class WgpuWindowsDxgiSharedTextureDescriptor {
     keyedMutex?.validate();
   }
 }
+
+final class WgpuWindowsD3D12DxgiSyntheticProofResult {
+  const WgpuWindowsD3D12DxgiSyntheticProofResult._({
+    required this.status,
+    required this.message,
+  });
+
+  const WgpuWindowsD3D12DxgiSyntheticProofResult.passed([String message = ''])
+    : this._(
+        status: WgpuWindowsD3D12DxgiSyntheticProofStatus.passed,
+        message: message,
+      );
+
+  const WgpuWindowsD3D12DxgiSyntheticProofResult.unsupported([
+    String message = '',
+  ]) : this._(
+         status: WgpuWindowsD3D12DxgiSyntheticProofStatus.unsupported,
+         message: message,
+       );
+
+  const WgpuWindowsD3D12DxgiSyntheticProofResult.failed([String message = ''])
+    : this._(
+        status: WgpuWindowsD3D12DxgiSyntheticProofStatus.failed,
+        message: message,
+      );
+
+  final WgpuWindowsD3D12DxgiSyntheticProofStatus status;
+  final String message;
+
+  bool get passed => status == WgpuWindowsD3D12DxgiSyntheticProofStatus.passed;
+}
+
+enum WgpuWindowsD3D12DxgiSyntheticProofStatus { passed, unsupported, failed }
 
 final class WgpuWindowsKeyedMutexSync {
   const WgpuWindowsKeyedMutexSync({

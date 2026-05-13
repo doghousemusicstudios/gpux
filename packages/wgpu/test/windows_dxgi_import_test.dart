@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:test/test.dart';
 import 'package:wgpu/wgpu.dart';
 
@@ -86,6 +88,50 @@ void main() {
         ),
         throwsArgumentError,
       );
+    });
+  });
+
+  group('Windows D3D12 DXGI shared texture synthetic proof', () {
+    test('rejects zero device handle before FFI', () {
+      final device = WgpuDevice.fromHandle(0);
+
+      expect(
+        () => device.windows.runD3D12DxgiSharedTextureSyntheticProof(),
+        throwsArgumentError,
+      );
+    });
+
+    test('reports synthetic proof status', () async {
+      if (!Platform.isWindows) {
+        final device = WgpuDevice.fromHandle(1);
+        final result = device.windows.runD3D12DxgiSharedTextureSyntheticProof();
+
+        expect(
+          result.status,
+          WgpuWindowsD3D12DxgiSyntheticProofStatus.unsupported,
+        );
+        expect(result.passed, isFalse);
+        expect(result.message, contains('only supported on Windows'));
+        return;
+      }
+
+      final instance = Wgpu.create();
+      final adapter = await instance.requestAdapter();
+      final device = await adapter.requestDevice();
+
+      final result = device.windows.runD3D12DxgiSharedTextureSyntheticProof();
+
+      if (result.status == WgpuWindowsD3D12DxgiSyntheticProofStatus.failed &&
+          result.message.contains('requires the D3D12 backend')) {
+        markTestSkipped(result.message);
+        return;
+      }
+
+      expect(result.status, WgpuWindowsD3D12DxgiSyntheticProofStatus.passed);
+      expect(result.passed, isTrue);
+
+      adapter.dispose();
+      instance.dispose();
     });
   });
 }

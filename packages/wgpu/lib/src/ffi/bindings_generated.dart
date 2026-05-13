@@ -73,6 +73,11 @@ external int wgpun_DeviceImportDxgiSharedTexture(
   int _producer_adapter_luid_high,
 );
 
+@ffi.Native<ffi.Uint8 Function(ffi.Uint64)>()
+external int wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof(
+  int _device,
+);
+
 @ffi.Native<ffi.Pointer<ffi.Void> Function(ffi.Pointer<ffi.Void>)>()
 external ffi.Pointer<ffi.Void> wgpun_IOSurfaceRetain(
   ffi.Pointer<ffi.Void> _iosurface,
