@@ -480,6 +480,9 @@ WGPUTexture wgpun_DeviceImportDxgiSharedTexture(WGPUDevice device,
 uint8_t wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof(WGPUDevice device)
 ;
 
+uint8_t wgpun_DeviceRunD3D11DxgiProducerBridgeSyntheticProof(WGPUDevice device)
+;
+
 #if defined(TARGET_APPLE)
  void *wgpun_IOSurfaceRetain(void *iosurface) ;
 #endif

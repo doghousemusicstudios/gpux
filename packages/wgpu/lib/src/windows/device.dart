@@ -80,10 +80,35 @@ final class WgpuWindowsDevice {
     }
     return WgpuWindowsD3D12DxgiSyntheticProofResult.failed(message);
   }
+
+  WgpuWindowsD3D11DxgiProducerBridgeProofResult
+  runD3D11DxgiProducerBridgeSyntheticProof() {
+    if (device.handle <= 0) {
+      throw ArgumentError('device handle must be positive');
+    }
+
+    final passed = wgpu_ffi
+        .wgpun_DeviceRunD3D11DxgiProducerBridgeSyntheticProof(device.handle);
+    if (passed != 0) {
+      return const WgpuWindowsD3D11DxgiProducerBridgeProofResult.passed(
+        'DXGI D3D11 producer bridge synthetic proof passed.',
+      );
+    }
+
+    final message =
+        wgpu_ffi.wgpuLastError() ??
+        'Native symbol $_d3d11DxgiProducerBridgeSyntheticProofNativeSymbol returned failure.';
+    if (message.contains('only supported on Windows')) {
+      return WgpuWindowsD3D11DxgiProducerBridgeProofResult.unsupported(message);
+    }
+    return WgpuWindowsD3D11DxgiProducerBridgeProofResult.failed(message);
+  }
 }
 
 const _d3d12DxgiSharedTextureSyntheticProofNativeSymbol =
     'wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof';
+const _d3d11DxgiProducerBridgeSyntheticProofNativeSymbol =
+    'wgpun_DeviceRunD3D11DxgiProducerBridgeSyntheticProof';
 
 final class WgpuWindowsDxgiSharedTextureDescriptor {
   const WgpuWindowsDxgiSharedTextureDescriptor({
@@ -174,6 +199,46 @@ final class WgpuWindowsD3D12DxgiSyntheticProofResult {
 }
 
 enum WgpuWindowsD3D12DxgiSyntheticProofStatus { passed, unsupported, failed }
+
+final class WgpuWindowsD3D11DxgiProducerBridgeProofResult {
+  const WgpuWindowsD3D11DxgiProducerBridgeProofResult._({
+    required this.status,
+    required this.message,
+  });
+
+  const WgpuWindowsD3D11DxgiProducerBridgeProofResult.passed([
+    String message = '',
+  ]) : this._(
+         status: WgpuWindowsD3D11DxgiProducerBridgeProofStatus.passed,
+         message: message,
+       );
+
+  const WgpuWindowsD3D11DxgiProducerBridgeProofResult.unsupported([
+    String message = '',
+  ]) : this._(
+         status: WgpuWindowsD3D11DxgiProducerBridgeProofStatus.unsupported,
+         message: message,
+       );
+
+  const WgpuWindowsD3D11DxgiProducerBridgeProofResult.failed([
+    String message = '',
+  ]) : this._(
+         status: WgpuWindowsD3D11DxgiProducerBridgeProofStatus.failed,
+         message: message,
+       );
+
+  final WgpuWindowsD3D11DxgiProducerBridgeProofStatus status;
+  final String message;
+
+  bool get passed =>
+      status == WgpuWindowsD3D11DxgiProducerBridgeProofStatus.passed;
+}
+
+enum WgpuWindowsD3D11DxgiProducerBridgeProofStatus {
+  passed,
+  unsupported,
+  failed,
+}
 
 final class WgpuWindowsKeyedMutexSync {
   const WgpuWindowsKeyedMutexSync({

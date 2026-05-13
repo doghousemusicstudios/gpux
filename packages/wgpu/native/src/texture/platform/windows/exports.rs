@@ -17,8 +17,16 @@ use std::sync::mpsc;
 use windows::core::{Interface, PCWSTR};
 #[cfg(target_os = "windows")]
 use windows::Win32::{
-    Foundation::{CloseHandle, GENERIC_ALL, HANDLE, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, GENERIC_ALL, HANDLE, HMODULE, LUID, WAIT_OBJECT_0},
     Graphics::{
+        Direct3D::D3D_DRIVER_TYPE_UNKNOWN,
+        Direct3D11::{
+            D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11DeviceContext, ID3D11Resource,
+            ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_RESOURCE_MISC_SHARED_NTHANDLE,
+            D3D11_SDK_VERSION, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+        },
+        Direct3D11on12::{D3D11On12CreateDevice, ID3D11On12Device, D3D11_RESOURCE_FLAGS},
         Direct3D12::{
             ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12Fence,
             ID3D12GraphicsCommandList, ID3D12Resource, D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -38,6 +46,7 @@ use windows::Win32::{
             DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
             DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
         },
+        Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIResource1},
     },
     System::Threading::{CreateEventW, WaitForSingleObject, INFINITE},
 };
@@ -60,6 +69,10 @@ impl OwnedDxgiHandle {
 
     fn value(&self) -> u64 {
         self.0 .0 as usize as u64
+    }
+
+    fn handle(&self) -> HANDLE {
+        self.0
     }
 }
 
@@ -337,11 +350,36 @@ fn validate_imported_texture_sentinel(
     width: u32,
     height: u32,
 ) -> Result<(), String> {
-    let bytes_per_row = width * 4;
-    let padded_bytes_per_row = (bytes_per_row + 255) & !255;
-    let buffer_size = (padded_bytes_per_row * height) as u64;
     let sentinel = synthetic_sentinel_pixels(width, height);
+    initialize_imported_texture_for_readback(entry, texture, width, height);
+    write_d3d12_sentinel_pixels(
+        raw_device,
+        raw_queue,
+        resource,
+        texture_desc,
+        width,
+        height,
+        &sentinel,
+    )?;
+    validate_imported_texture_pixels(
+        entry,
+        texture,
+        width,
+        height,
+        &sentinel,
+        "DXGI synthetic proof",
+    )
+}
 
+#[cfg(target_os = "windows")]
+fn initialize_imported_texture_for_readback(
+    entry: &DeviceEntry,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) {
+    let bytes_per_row = width * 4;
+    let pixels = vec![0u8; (bytes_per_row * height) as usize];
     entry.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -349,7 +387,7 @@ fn validate_imported_texture_sentinel(
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
-        &sentinel,
+        &pixels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(bytes_per_row),
@@ -363,18 +401,26 @@ fn validate_imported_texture_sentinel(
     );
     entry.queue.submit(std::iter::empty());
     let _ = entry.device.poll(wgpu::PollType::wait_indefinitely());
-    write_d3d12_sentinel_pixels(
-        raw_device,
-        raw_queue,
-        resource,
-        texture_desc,
-        width,
-        height,
-        &sentinel,
-    )?;
+}
+
+#[cfg(target_os = "windows")]
+fn validate_imported_texture_pixels(
+    entry: &DeviceEntry,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+    expected_pixels: &[u8],
+    proof_name: &str,
+) -> Result<(), String> {
+    let bytes_per_row = width * 4;
+    let padded_bytes_per_row = (bytes_per_row + 255) & !255;
+    let buffer_size = (padded_bytes_per_row * height) as u64;
+    if expected_pixels.len() != (bytes_per_row * height) as usize {
+        return Err(format!("{proof_name} expected pixel byte count is invalid"));
+    }
 
     let staging = entry.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("DXGI synthetic proof readback"),
+        label: Some("DXGI proof readback"),
         size: buffer_size,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
@@ -383,7 +429,7 @@ fn validate_imported_texture_sentinel(
     let mut encoder = entry
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("DXGI synthetic proof readback encoder"),
+            label: Some("DXGI proof readback encoder"),
         });
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
@@ -417,11 +463,9 @@ fn validate_imported_texture_sentinel(
     match rx.recv() {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
-            return Err(format!(
-                "DXGI synthetic proof readback map_async failed: {error}"
-            ));
+            return Err(format!("{proof_name} readback map_async failed: {error}"));
         }
-        Err(_) => return Err("DXGI synthetic proof readback channel closed".to_string()),
+        Err(_) => return Err(format!("{proof_name} readback channel closed")),
     }
 
     let mismatch = {
@@ -430,7 +474,8 @@ fn validate_imported_texture_sentinel(
         for y in 0..height {
             let expected_start = (y * bytes_per_row) as usize;
             let actual_start = (y * padded_bytes_per_row) as usize;
-            let expected = &sentinel[expected_start..expected_start + bytes_per_row as usize];
+            let expected =
+                &expected_pixels[expected_start..expected_start + bytes_per_row as usize];
             let actual = &mapped[actual_start..actual_start + bytes_per_row as usize];
             if actual != expected {
                 let byte_index = actual
@@ -447,7 +492,7 @@ fn validate_imported_texture_sentinel(
     staging.unmap();
     if let Some((row, byte_index, actual, expected)) = mismatch {
         return Err(format!(
-            "DXGI synthetic proof sentinel mismatch on row {row}, byte {byte_index}: actual {actual:#04x}, expected {expected:#04x}"
+            "{proof_name} sentinel mismatch on row {row}, byte {byte_index}: actual {actual:#04x}, expected {expected:#04x}"
         ));
     }
     Ok(())
@@ -496,6 +541,191 @@ fn create_d3d12_shared_texture(
             .map_err(|error| format!("ID3D12Device::CreateSharedHandle failed: {error}"))?;
 
     Ok((texture_desc, resource, OwnedDxgiHandle::new(shared_handle)))
+}
+
+#[cfg(target_os = "windows")]
+fn find_dxgi_adapter_by_luid(
+    factory: &IDXGIFactory1,
+    target_luid: LUID,
+) -> Result<IDXGIAdapter1, String> {
+    let mut index = 0;
+    loop {
+        let adapter = match unsafe { factory.EnumAdapters1(index) } {
+            Ok(adapter) => adapter,
+            Err(_) => break,
+        };
+        let desc = unsafe { adapter.GetDesc1() }
+            .map_err(|error| format!("IDXGIAdapter1::GetDesc1 failed: {error}"))?;
+        if desc.AdapterLuid.LowPart == target_luid.LowPart
+            && desc.AdapterLuid.HighPart == target_luid.HighPart
+        {
+            return Ok(adapter);
+        }
+        index += 1;
+    }
+    Err(format!(
+        "No DXGI adapter found for renderer LUID {:08x}:{:08x}",
+        target_luid.HighPart as u32, target_luid.LowPart
+    ))
+}
+
+#[cfg(target_os = "windows")]
+fn create_d3d11_device_for_luid(
+    adapter_luid: LUID,
+) -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
+    let factory: IDXGIFactory1 =
+        unsafe { CreateDXGIFactory1() }.map_err(|error| format!("{error}"))?;
+    let adapter = find_dxgi_adapter_by_luid(&factory, adapter_luid)?;
+
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    unsafe {
+        D3D11CreateDevice(
+            &adapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut context),
+        )
+    }
+    .map_err(|error| format!("D3D11CreateDevice failed: {error}"))?;
+
+    let device = device.ok_or_else(|| "D3D11CreateDevice returned no device".to_string())?;
+    let context = context.ok_or_else(|| "D3D11CreateDevice returned no context".to_string())?;
+    Ok((device, context))
+}
+
+#[cfg(target_os = "windows")]
+fn create_d3d11_nt_handle_producer(
+    adapter_luid: LUID,
+    width: u32,
+    height: u32,
+    sentinel: &[u8],
+) -> Result<(ID3D11Texture2D, OwnedDxgiHandle), String> {
+    let (device, context) = create_d3d11_device_for_luid(adapter_luid)?;
+    let bytes_per_row = width * 4;
+    if sentinel.len() != (bytes_per_row * height) as usize {
+        return Err("D3D11 producer sentinel byte count is invalid".to_string());
+    }
+
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: width,
+        Height: height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+        CPUAccessFlags: 0,
+        MiscFlags: D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32,
+    };
+    let initial_data = D3D11_SUBRESOURCE_DATA {
+        pSysMem: sentinel.as_ptr() as *const c_void,
+        SysMemPitch: bytes_per_row,
+        SysMemSlicePitch: bytes_per_row * height,
+    };
+    let mut texture: Option<ID3D11Texture2D> = None;
+    unsafe { device.CreateTexture2D(&desc, Some(&initial_data), Some(&mut texture)) }
+        .map_err(|error| format!("ID3D11Device::CreateTexture2D producer failed: {error}"))?;
+    let texture = texture
+        .ok_or_else(|| "ID3D11Device::CreateTexture2D returned no producer texture".to_string())?;
+    unsafe {
+        context.Flush();
+    }
+
+    let dxgi_resource: IDXGIResource1 = texture
+        .cast()
+        .map_err(|error| format!("ID3D11Texture2D::cast<IDXGIResource1> failed: {error}"))?;
+    let handle = unsafe { dxgi_resource.CreateSharedHandle(None, GENERIC_ALL.0, PCWSTR::null()) }
+        .map_err(|error| format!("IDXGIResource1::CreateSharedHandle failed: {error}"))?;
+
+    Ok((texture, OwnedDxgiHandle::new(handle)))
+}
+
+#[cfg(target_os = "windows")]
+fn create_d3d11on12_bridge(
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    raw_queue: &ID3D12CommandQueue,
+) -> Result<(ID3D11Device, ID3D11DeviceContext, ID3D11On12Device), String> {
+    let mut device: Option<ID3D11Device> = None;
+    let mut context: Option<ID3D11DeviceContext> = None;
+    let queues = [Some(raw_queue.cast().map_err(|error| {
+        format!("ID3D12CommandQueue::cast<IUnknown> failed: {error}")
+    })?)];
+
+    unsafe {
+        D3D11On12CreateDevice(
+            raw_device,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT.0,
+            None,
+            Some(&queues),
+            0,
+            Some(&mut device as *mut _),
+            Some(&mut context as *mut _),
+            None,
+        )
+    }
+    .map_err(|error| format!("D3D11On12CreateDevice failed: {error}"))?;
+
+    let device = device.ok_or_else(|| "D3D11On12CreateDevice returned no device".to_string())?;
+    let context = context.ok_or_else(|| "D3D11On12CreateDevice returned no context".to_string())?;
+    let device_11on12: ID3D11On12Device = device
+        .cast()
+        .map_err(|error| format!("ID3D11Device::cast<ID3D11On12Device> failed: {error}"))?;
+
+    Ok((device, context, device_11on12))
+}
+
+#[cfg(target_os = "windows")]
+fn copy_d3d11_producer_into_d3d12_resource(
+    raw_device: &windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    raw_queue: &ID3D12CommandQueue,
+    producer_handle: &OwnedDxgiHandle,
+    destination: &ID3D12Resource,
+) -> Result<(), String> {
+    let (bridge_device, bridge_context, bridge_11on12) =
+        create_d3d11on12_bridge(raw_device, raw_queue)?;
+    let bridge_device1: ID3D11Device1 = bridge_device
+        .cast()
+        .map_err(|error| format!("ID3D11Device::cast<ID3D11Device1> failed: {error}"))?;
+    let producer_texture: ID3D11Texture2D =
+        unsafe { bridge_device1.OpenSharedResource1(producer_handle.handle()) }
+            .map_err(|error| format!("ID3D11Device1::OpenSharedResource1 failed: {error}"))?;
+    let producer_resource: ID3D11Resource = producer_texture
+        .cast()
+        .map_err(|error| format!("ID3D11Texture2D::cast<ID3D11Resource> failed: {error}"))?;
+
+    let mut wrapped: Option<ID3D11Resource> = None;
+    unsafe {
+        bridge_11on12.CreateWrappedResource(
+            destination,
+            &D3D11_RESOURCE_FLAGS::default(),
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COMMON,
+            &mut wrapped,
+        )
+    }
+    .map_err(|error| format!("ID3D11On12Device::CreateWrappedResource failed: {error}"))?;
+    let wrapped = wrapped.ok_or_else(|| {
+        "ID3D11On12Device::CreateWrappedResource returned no resource".to_string()
+    })?;
+
+    let wrapped_resources = [Some(wrapped.clone())];
+    unsafe {
+        bridge_11on12.AcquireWrappedResources(&wrapped_resources);
+        bridge_context.CopyResource(&wrapped, &producer_resource);
+        bridge_11on12.ReleaseWrappedResources(&wrapped_resources);
+        bridge_context.Flush();
+    }
+    wait_for_d3d12_queue(raw_device, raw_queue)
 }
 
 #[cfg(target_os = "windows")]
@@ -694,6 +924,58 @@ fn run_d3d12_dxgi_shared_texture_synthetic_proof(device: WGPUDevice) -> Result<(
 }
 
 #[cfg(target_os = "windows")]
+fn run_d3d11_dxgi_producer_bridge_synthetic_proof(device: WGPUDevice) -> Result<(), String> {
+    if device == 0 {
+        return Err("device must not be 0".to_string());
+    }
+
+    let entry = unsafe { deref_handle::<DeviceEntry>(device) };
+    let hal_device = match unsafe { entry.device.as_hal::<wgpu::hal::api::Dx12>() } {
+        Some(hal_device) => hal_device,
+        None => {
+            return Err(
+                "DXGI D3D11 producer bridge synthetic proof requires the D3D12 backend".to_string(),
+            );
+        }
+    };
+    let raw_device = hal_device.raw_device();
+    let raw_queue = hal_device.raw_queue();
+    let luid = unsafe { raw_device.GetAdapterLuid() };
+    let width = 45;
+    let height = 19;
+    let sentinel = synthetic_sentinel_pixels(width, height);
+
+    let (_producer_texture, producer_handle) =
+        create_d3d11_nt_handle_producer(luid, width, height, &sentinel)?;
+    let (_destination_desc, destination, destination_handle) = create_d3d12_shared_texture(
+        raw_device,
+        width,
+        height,
+        D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+    )?;
+    let texture = import_synthetic_shared_texture(
+        device,
+        &destination_handle,
+        width,
+        height,
+        luid.LowPart,
+        luid.HighPart,
+    )?;
+    initialize_imported_texture_for_readback(entry, &texture, width, height);
+    copy_d3d11_producer_into_d3d12_resource(raw_device, raw_queue, &producer_handle, &destination)?;
+    validate_imported_texture_pixels(
+        entry,
+        &texture,
+        width,
+        height,
+        &sentinel,
+        "DXGI D3D11 producer bridge proof",
+    )?;
+    drop(texture);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 #[allow(clippy::too_many_arguments)]
 fn import_dxgi_shared_texture(
     device: WGPUDevice,
@@ -878,6 +1160,27 @@ pub extern "C" fn wgpuDeviceRunD3D12DxgiSharedTextureSyntheticProof(device: WGPU
 #[export_name = "wgpun_DeviceRunD3D12DxgiSharedTextureSyntheticProof"]
 pub extern "C" fn wgpuDeviceRunD3D12DxgiSharedTextureSyntheticProof(_device: WGPUDevice) -> u8 {
     set_error("DXGI D3D12 shared texture synthetic proof is only supported on Windows");
+    0
+}
+
+#[cfg(target_os = "windows")]
+#[export_name = "wgpun_DeviceRunD3D11DxgiProducerBridgeSyntheticProof"]
+pub extern "C" fn wgpuDeviceRunD3D11DxgiProducerBridgeSyntheticProof(device: WGPUDevice) -> u8 {
+    ffi_catch!(0, {
+        match run_d3d11_dxgi_producer_bridge_synthetic_proof(device) {
+            Ok(()) => 1,
+            Err(error) => {
+                set_error(error);
+                0
+            }
+        }
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+#[export_name = "wgpun_DeviceRunD3D11DxgiProducerBridgeSyntheticProof"]
+pub extern "C" fn wgpuDeviceRunD3D11DxgiProducerBridgeSyntheticProof(_device: WGPUDevice) -> u8 {
+    set_error("DXGI D3D11 producer bridge synthetic proof is only supported on Windows");
     0
 }
 
