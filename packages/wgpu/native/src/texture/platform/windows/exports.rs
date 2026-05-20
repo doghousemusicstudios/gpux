@@ -722,18 +722,13 @@ fn copy_d3d11_producer_into_d3d12_resource(
         .map_err(|error| format!("ID3D11Texture2D::cast<IDXGIKeyedMutex> failed: {error}"))?;
 
     let mut wrapped: Option<ID3D11Resource> = None;
-    let flags11 = D3D11_RESOURCE_FLAGS {
-        BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
-        MiscFlags: 0,
-        CPUAccessFlags: 0,
-        StructureByteStride: 0,
-    };
+    let flags11 = D3D11_RESOURCE_FLAGS::default();
     unsafe {
         bridge_11on12.CreateWrappedResource(
             destination,
             &flags11,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COMMON,
             &mut wrapped,
         )
     }

@@ -44,11 +44,20 @@ impl SwapchainSurface {
             return Err("No supported surface formats".to_string());
         }
 
-        // Prefer sRGB format, fallback to first available
-        let format = caps
-            .formats
+        // Prefer formats the projector/output pipelines can actually render
+        // into. Some Windows drivers expose HDR-ish formats (for example
+        // Rg11b10Ufloat) through surface capabilities, but wgpu rejects them
+        // as color targets during render-pipeline creation.
+        const PREFERRED_RENDERABLE_FORMATS: &[wgpu::TextureFormat] = &[
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Rgba16Float,
+        ];
+        let format = PREFERRED_RENDERABLE_FORMATS
             .iter()
-            .find(|f| f.is_srgb())
+            .find(|format| caps.formats.contains(format))
             .copied()
             .unwrap_or(caps.formats[0]);
 

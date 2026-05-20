@@ -76,14 +76,14 @@ pub extern "C" fn wgpu_swapchain_get_format(surface_id: u64) -> u32 {
         }
         let surface = unsafe { deref_handle::<SwapchainSurface>(surface_id) };
         match surface.format() {
-            wgpu::TextureFormat::Bgra8Unorm => 26,
-            wgpu::TextureFormat::Bgra8UnormSrgb => 27,
-            wgpu::TextureFormat::Rgba8Unorm => 21,
-            wgpu::TextureFormat::Rgba8UnormSrgb => 22,
-            wgpu::TextureFormat::Rgba16Float => 37,
+            wgpu::TextureFormat::Bgra8Unorm => 22,
+            wgpu::TextureFormat::Bgra8UnormSrgb => 23,
+            wgpu::TextureFormat::Rgba8Unorm => 17,
+            wgpu::TextureFormat::Rgba8UnormSrgb => 18,
+            wgpu::TextureFormat::Rgba16Float => 33,
             other => {
                 log::warn!("Unexpected swapchain format: {:?}", other);
-                26 // fallback to Bgra8Unorm
+                22 // fallback to Bgra8Unorm
             }
         }
     }
