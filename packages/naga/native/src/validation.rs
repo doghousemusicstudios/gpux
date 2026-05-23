@@ -31,7 +31,7 @@ fn validation_error_to_result(
     error: &naga::WithSpan<naga::valid::ValidationError>,
     source: &str,
 ) -> NagaValidationResult {
-    let message = format!("{}", error);
+    let message = format_error_chain(error);
     let (offset, length) = error
         .spans()
         .next()
@@ -42,4 +42,20 @@ fn validation_error_to_result(
         .unwrap_or((-1, -1));
 
     make_single_error(&message, offset, length)
+}
+
+/// Format the full error chain by walking `source()`. naga's
+/// validation errors carry the most informative root cause one or
+/// more levels down (e.g. "Entry point main at Fragment is invalid"
+/// → "Function [0] 'main' is invalid" → "Expression [12] is invalid"
+/// → "Type resolution failed: 'sampler2D' is not a constructible
+/// type"). The outermost message alone is rarely actionable.
+fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = format!("{}", error);
+    let mut current = error.source();
+    while let Some(inner) = current {
+        out.push_str(&format!("\n  Caused by: {}", inner));
+        current = inner.source();
+    }
+    out
 }
